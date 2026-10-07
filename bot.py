@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import edge_tts
+import httpx
 from dotenv import load_dotenv
 from telegram import (
     BotCommand,
@@ -54,12 +55,17 @@ INWORLD_DEFAULT_VOICE = os.getenv("INWORLD_VOICE", "Ashley").strip() or "Ashley"
 INWORLD_LANGUAGE = os.getenv("INWORLD_LANGUAGE", "km-KH").strip() or "km-KH"
 INWORLD_DELIVERY_MODE = os.getenv("INWORLD_DELIVERY_MODE", "BALANCED").strip() or "BALANCED"
 INWORLD_API_KEY = os.getenv("INWORLD_API_KEY", "").strip()
+KIRI_API_KEY = os.getenv("KIRI_API_KEY", "").strip()
+KIRI_BASE_URL = os.getenv("KIRI_BASE_URL", "https://api.kiritts.com/v1").strip().rstrip("/")
+KIRI_MODEL = os.getenv("KIRI_MODEL", "kiritts").strip() or "kiritts"
+KIRI_DEFAULT_VOICE = os.getenv("KIRI_VOICE", "Maly").strip() or "Maly"
 DEFAULT_LEADING_SILENCE_SECONDS = os.getenv("TTS_LEADING_SILENCE_SECONDS", "0").strip() or "0"
 TTS_MODELS = {
     "edge": "Edge TTS (free)",
     "inworld-tts-2": "Inworld Realtime TTS-2",
     "inworld-tts-1.5-mini": "Inworld TTS 1.5 Mini",
     "inworld-tts-1.5-max": "Inworld TTS 1.5 Max",
+    "kiri": "Kiri TTS (Khmer + Voice Clone)",
 }
 LEADING_SILENCE_OPTIONS = {
     "0": 0.0,
@@ -348,6 +354,11 @@ HINTS_EDGE = {
     "en": "Change it: /voice km-KH-SreymomNeural",
     "ru": "Сменить: /voice km-KH-SreymomNeural",
 }
+HINTS_KIRI = {
+    "km": "ប្តូរ៖ /voice Maly (ឬឈ្មោះសំឡេង clone របស់អ្នក) · មើលបញ្ជី៖ /voices",
+    "en": "Change it: /voice Maly (or your cloned voice name) · list: /voices",
+    "ru": "Сменить: /voice Maly (или имя клона) · список: /voices",
+}
 HINTS_INWORLD = {
     "km": "ប្តូរ៖ /voice Dmitry, Elena, Nikolai, Svetlana, Ashley…",
     "en": "Change it: /voice Dmitry, Elena, Nikolai, Svetlana, Ashley…",
@@ -406,12 +417,17 @@ def inworld_available() -> bool:
 
 
 def enabled_models() -> dict[str, str]:
-    """Edge is always on; Inworld models appear only when an API key and the package exist."""
-    return {
-        key: label
-        for key, label in TTS_MODELS.items()
-        if key == "edge" or inworld_available()
-    }
+    """Edge is always on; Inworld/Kiri models appear only when their API key is configured."""
+    result = {}
+    for key, label in TTS_MODELS.items():
+        if key == "edge":
+            result[key] = label
+        elif key == "kiri":
+            if KIRI_API_KEY:
+                result[key] = label
+        elif inworld_available():
+            result[key] = label
+    return result
 
 
 def get_tts_model(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -457,16 +473,22 @@ def settings_keyboard(current_model: str, current_silence: float) -> InlineKeybo
 def get_voice_for_model(context: ContextTypes.DEFAULT_TYPE, model: str) -> str:
     if model == "edge":
         return context.user_data.get("edge_voice") or context.user_data.get("voice", DEFAULT_VOICE)
+    if model == "kiri":
+        return context.user_data.get("kiri_voice") or KIRI_DEFAULT_VOICE
     return context.user_data.get("inworld_voice") or INWORLD_DEFAULT_VOICE
 
 
 def voice_example_for_model(model: str) -> str:
+    if model == "kiri":
+        return "Maly"
     return "km-KH-SreymomNeural" if model == "edge" else "Dmitry"
 
 
 def voice_hint_for_model(context: ContextTypes.DEFAULT_TYPE, model: str) -> str:
     if model == "edge":
         return HINTS_EDGE[get_lang(context)]
+    if model == "kiri":
+        return HINTS_KIRI[get_lang(context)]
     return HINTS_INWORLD[get_lang(context)]
 
 
@@ -645,6 +667,29 @@ async def synthesize_mp3(text: str, model: str = "edge", voice: str = DEFAULT_VO
         await asyncio.to_thread(generate_inworld)
         return await add_leading_silence(out, leading_silence)
 
+    if model == "kiri":
+        if not KIRI_API_KEY:
+            raise RuntimeError("KIRI_API_KEY is not configured on the server")
+        async with httpx.AsyncClient(timeout=httpx.Timeout(TTS_TIMEOUT_SECONDS, connect=10.0)) as client:
+            response = await client.post(
+                f"{KIRI_BASE_URL}/audio/speech",
+                headers={"Authorization": f"Bearer {KIRI_API_KEY}"},
+                json={
+                    "model": KIRI_MODEL,
+                    "input": text,
+                    "voice": voice,
+                    "response_format": "mp3",
+                },
+            )
+        if response.status_code != 200:
+            try:
+                detail = str(response.json().get("detail", ""))
+            except Exception:  # noqa: BLE001
+                detail = response.text[:200]
+            raise RuntimeError(f"Kiri TTS error {response.status_code}: {detail}")
+        out.write_bytes(response.content)
+        return await add_leading_silence(out, leading_silence)
+
     raise ValueError(f"Unsupported TTS model: {model}")
 
 
@@ -699,11 +744,39 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def kiri_voices_text() -> str:
+    """List voices (built-in + cloned) available to the configured Kiri key."""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            response = await client.get(f"{KIRI_BASE_URL}/voices", headers={"Authorization": f"Bearer {KIRI_API_KEY}"})
+        response.raise_for_status()
+        data = response.json()
+        items = data.get("data", data.get("voices", data)) if isinstance(data, dict) else data
+        names = []
+        for item in items or []:
+            if isinstance(item, str):
+                names.append(item)
+            elif isinstance(item, dict):
+                name = item.get("name") or item.get("voice") or item.get("id")
+                if name:
+                    names.append(str(name))
+        if not names:
+            return "Kiri: no voices returned.\n\nUse: /voice Maly"
+        return "Kiri voices:\n" + "\n".join(f"• {n}" for n in names[:40]) + "\n\nUse: /voice <name>"
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Kiri voices failed: %s", exc)
+        return "Kiri voices unavailable right now.\n\nUse: /voice Maly"
+
+
 async def voices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await register_user(update, context, "voices")
     user_id = update.effective_user.id if update.effective_user else None
     model = get_tts_model(context)
-    await update.message.reply_text(voice_examples_text(context, model), reply_markup=main_menu(context, user_id))
+    if model == "kiri":
+        text = await kiri_voices_text()
+    else:
+        text = voice_examples_text(context, model)
+    await update.message.reply_text(text, reply_markup=main_menu(context, user_id))
 
 
 async def language_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -803,13 +876,18 @@ async def voice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reply_markup=main_menu(context, user_id),
         )
         return
-    voice = context.args[0].strip()
+    voice = " ".join(context.args).strip() if model == "kiri" else context.args[0].strip()
     if model == "edge":
         if not re.fullmatch(r"[a-z]{2}-[A-Z]{2}-[A-Za-z]+Neural", voice):
             await update.message.reply_text(t(context, "invalid_voice", example=voice_example_for_model(model)), reply_markup=main_menu(context, user_id))
             return
         context.user_data["edge_voice"] = voice
         context.user_data["voice"] = voice  # backward compatibility with existing saved state
+    elif model == "kiri":
+        if not re.fullmatch(r"[\w .:-]{1,80}", voice):
+            await update.message.reply_text(t(context, "invalid_voice", example=voice_example_for_model(model)), reply_markup=main_menu(context, user_id))
+            return
+        context.user_data["kiri_voice"] = voice
     else:
         if not re.fullmatch(r"[A-Za-z0-9_.:-]{2,80}", voice):
             await update.message.reply_text(t(context, "invalid_voice", example=voice_example_for_model(model)), reply_markup=main_menu(context, user_id))
@@ -1185,7 +1263,7 @@ def build_application(persistence: PicklePersistence | None = None) -> Applicati
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("users", users_cmd))
     app.add_handler(CallbackQueryHandler(language_callback, pattern=r"^lang:(km|en|ru)$"))
-    app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:(edge|inworld-tts-2|inworld-tts-1\.5-mini|inworld-tts-1\.5-max)$"))
+    app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:(edge|inworld-tts-2|inworld-tts-1\.5-mini|inworld-tts-1\.5-max|kiri)$"))
     app.add_handler(CallbackQueryHandler(silence_callback, pattern=r"^silence:(0|0\.5|1)$"))
     app.add_handler(CallbackQueryHandler(stt_callback, pattern=r"^stt:"))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.Document.AUDIO, handle_audio))

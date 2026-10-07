@@ -1,0 +1,3 @@
+# Optional: only needed if you want the Inworld TTS models (also set INWORLD_API_KEY).
+-r requirements.txt
+inworld-tts==1.2.1

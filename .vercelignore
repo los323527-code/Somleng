@@ -1,0 +1,8 @@
+Dockerfile
+telegram-tts-bot.service
+requirements-extra.txt
+README.md
+.env
+.env.*
+data/
+setup_webhook.py
